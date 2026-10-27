@@ -1,0 +1,70 @@
+name: Original CLI login preflight
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/login-preflight.yml'
+permissions:
+  contents: read
+concurrency:
+  group: original-login-preflight
+  cancel-in-progress: false
+jobs:
+  login-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install original published package
+        run: python -m pip install --disable-pip-version-check 'bili-agent==1.2.1'
+      - name: Test original QR generation without exposing login material
+        shell: python
+        run: |
+          import json, os, pathlib, shutil, subprocess, tempfile
+          from importlib.metadata import version
+          home = tempfile.mkdtemp(prefix="bili-login-preflight-")
+          env = os.environ.copy()
+          env["BILI_CLI_HOME"] = home
+          env.pop("BILI_CLI_DEBUG", None)
+          report = {
+              "package": "bili-agent",
+              "version": version("bili-agent"),
+              "command": "bili auth login --wait 0",
+              "qr_generated": False,
+              "scan_attempted": False,
+              "login_verified": False,
+              "persistence_verified": False,
+          }
+          try:
+              result = subprocess.run(
+                  ["bili", "auth", "login", "--wait", "0"],
+                  env=env, capture_output=True, text=True, timeout=90
+              )
+              report["exit_code"] = result.returncode
+              try:
+                  payload = json.loads(result.stdout)
+              except (ValueError, TypeError):
+                  payload = {}
+              data = payload.get("data") or {}
+              error = payload.get("error") or {}
+              report["qr_generated"] = (
+                  payload.get("ok") is True
+                  and data.get("status") == "pending"
+                  and pathlib.Path(home, "login_qrcode.png").is_file()
+              )
+              allowed = {"network_error", "api_error", "risk_control", "captcha_required",
+                         "rate_limited", "internal_error", "login_expired", "login_pending"}
+              report["error_code"] = error.get("code") if error.get("code") in allowed else None
+          except subprocess.TimeoutExpired:
+              report["error_code"] = "process_timeout"
+          finally:
+              shutil.rmtree(home)
+          report["temporary_login_material_deleted"] = not pathlib.Path(home).exists()
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Original CLI QR generation preflight only. No scan, authenticated UID, or persistence test.\n\n")
+              summary.write(json.dumps(report, indent=2))
+          if not report["qr_generated"]:
+              raise SystemExit(1)
